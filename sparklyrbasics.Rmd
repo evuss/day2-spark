@@ -1,0 +1,54 @@
+---
+title: "Spark basics"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(sparklyr)
+library(dplyr)
+library(nycflights13)
+sc <- spark_connect(master = "local")
+```
+
+```{r}
+summary(flights)
+flights_tbl <- copy_to(sc, flights, "flights", overwrite = TRUE)
+```
+
+```{r}
+flights_tbl %>%
+  sdf_partition(training = 0.7, test = 0.3, seed = 888) ->
+  partitions
+```
+
+```{r}
+partitions$training %>%
+  ml_linear_regression(arr_delay ~ carrier + origin + dest + hour) -> 
+  fit
+```
+
+```{r}
+summary(fit)
+```
+
+```{r}
+library(ggplot2)
+sdf_predict(fit, partitions$test) %>%
+  sdf_register("scored_data")
+  
+tbl(sc, "scored_data") %>% 
+  select(arr_delay, prediction) %>% 
+  collect()  ->
+  predicted_vals
+
+predicted_vals %>%
+  ggplot(aes(x = arr_delay, y = prediction)) +
+  geom_abline(lty = "dashed", col = "red") +
+  geom_jitter(alpha=.5) +
+  coord_fixed(ratio = 1) +
+  labs(
+    x = "Actual arrdelay",
+    y = "Predicted arrdelay",
+    title = "Predicted vs. Actual"
+  )
+```
