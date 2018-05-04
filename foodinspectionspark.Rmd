@@ -1,0 +1,123 @@
+---
+title: "Food inspections using Spark"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Import data into environment
+dat_model <- readRDS("~/food-inspections-evaluation/DATA/dat_model.Rds")
+```
+
+# Getting the connection working to Spark local
+```{r}
+library(sparklyr)
+library(dplyr)
+library(ggplot2)
+
+sc <- spark_connect("local")
+dat_modelS <- copy_to(sc, dat_model[,-1], "datmodelspark", overwrite = TRUE)
+head(dat_modelS)
+```
+
+# The partition code from the R project
+```{r}
+library(modelr)
+library(tidyverse)
+library(recipes)
+
+# divide into train and test
+
+dat_model %>% 
+  modelr::resample_partition(c(train=0.7, test=0.3)) ->
+  dat_splitraw
+
+dat_splitraw %>% 
+  pluck("train") %>% 
+  as_data_frame()->
+  dat_splittrainraw
+
+dat_splitraw %>% 
+  pluck("test") %>% 
+  as_data_frame()->
+  dat_splittestraw
+
+```
+
+# The partition and model code for Spark
+The same code but for Spark
+```{r}
+# Spark
+
+# partition
+partitions_tbl <- tbl(sc, "datmodelspark") %>%
+  sdf_partition(training = 0.7, test = 0.3, seed = 1099)
+
+head(partitions_tbl$training)
+
+partitions_tbl$training %>% 
+  select_if(is.numeric) %>%
+  summarise_all(c("mean", "min"))
+
+# making a decision tree model with Spark
+fit <- partitions_tbl$training %>%
+  ml_decision_tree(response = "fail_flag", features = c("criticalCount","heat_burglary","Facility_Type"))
+
+ml_predict(fit,partitions_tbl$test)
+ml_decision_tree(partitions_tbl$training, response = "fail_flag", features = c("criticalCount","heat_burglary","Facility_Type"))
+
+fit$features
+
+# prediction
+partitions_tbl$training %>% 
+  select(criticalCount,heat_burglary,Facility_Type,fail_flag) %>% 
+  sdf_predict(fit, .) 
+  # ft_string_indexer("fail_flag", "failflagindex") %>% 
+  # collect
+  
+#since this isn't working, make it again later by following https://beta.rstudioconnect.com/content/1518/notebook-classification.html#auc_and_accuracy
+
+ 
+dt_predicttable <- table(dt_predict$failflagindex,dt_predict$prediction)
+
+head(dt_predict$prediction)
+
+
+fitRF <- partitions_tbl$training %>%
+  ml_random_forest(response = "fail_flag", features = c("criticalCount","heat_burglary","Facility_Type"), type = "classification")
+
+head(fitRF$feature.importances)
+head(fitRF$trees)
+head(fitRF$response)
+
+RFPredict <- sdf_predict(fitRF, partitions_tbl)
+
+summary(fitRF)
+
+fitRF
+
+# example code #
+rf_predict <- sdf_predict(rf_model, iris_tbl) %>%
+  ft_string_indexer("Species", "Species_idx") %>%
+  collect
+
+table(rf_predict$Species_idx, rf_predict$prediction)
+
+sPredict <- predict(fit, partitions_tbl$test)
+head(sPredict)
+
+
+
+
+```
+# Some options for working with spark result sets
+- use lazy excecution to construct statements and get the results on the fly
+- use sdf_register() to put the results into a spark table
+- use sdf_persist() to force any pending calcs to happen - doesn't necessarily persist in a nicly named object
+- use collect() to perform the calcs and bring the results into a data.frame in R
+
+
+
