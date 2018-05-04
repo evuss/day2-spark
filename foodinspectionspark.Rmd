@@ -7,6 +7,12 @@ output: github_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# Some options for working with spark result sets
+- use lazy excecution to construct statements and get the results on the fly
+- use sdf_register() to put the results into a spark table
+- use sdf_persist() to force any pending calcs to happen - doesn't necessarily persist in a nicly named object
+- use collect() to perform the calcs and bring the results into a data.frame in R
+
 ```{r}
 # Import data into environment
 dat_model <- readRDS("~/food-inspections-evaluation/DATA/dat_model.Rds")
@@ -66,6 +72,13 @@ partitions_tbl$training %>%
 fit <- partitions_tbl$training %>%
   ml_decision_tree(response = "fail_flag", features = c("criticalCount","heat_burglary","Facility_Type"))
 
+fit # info of the model
+
+# evaluate model
+fitcollect <- collect(ml_tree_feature_importance(sc, fit))
+fitcollect # will show the feature importance
+
+
 ml_predict(fit,partitions_tbl$test)
 ml_decision_tree(partitions_tbl$training, response = "fail_flag", features = c("criticalCount","heat_burglary","Facility_Type"))
 
@@ -78,9 +91,11 @@ partitions_tbl$training %>%
   # ft_string_indexer("fail_flag", "failflagindex") %>% 
   # collect
   
-#since this isn't working, make it again later by following https://beta.rstudioconnect.com/content/1518/notebook-classification.html#auc_and_accuracy
 
- 
+```
+
+```{r}
+ # some work in progress/ loose notes
 dt_predicttable <- table(dt_predict$failflagindex,dt_predict$prediction)
 
 head(dt_predict$prediction)
@@ -109,15 +124,272 @@ table(rf_predict$Species_idx, rf_predict$prediction)
 sPredict <- predict(fit, partitions_tbl$test)
 head(sPredict)
 
+```
 
+# Following sparklyr guide to test the spark ml functions
+https://beta.rstudioconnect.com/content/1518/notebook-classification.html#overview
 
+I would in a later stage use the food inspection data into this code to evaluate different models. 
+
+## Load data and packages
+```{r}
+library(sparklyr)
+library(dplyr)
+library(tidyr)
+library(titanic)
+library(ggplot2)
+library(purrr)
+
+titanicdata <- titanic::titanic_train
+
+# Connect to local spark cluster and load data
+sc <- spark_connect(master = "local", version = "2.0.0")
+copy_to(sc, titanicdata, "titanic", overwrite = TRUE)
+
+titanic_tbl <- tbl(sc, "titanic")
+```
+
+Tidy the data in preparation for model fitting. sparkyr uses dplyr syntax when connecting to the Spark SQL API and specific functions functions for connecting to the Spark ML API.
+
+Spark SQL transforms
+Use feature transforms with Spark SQL. Create new features and modify existing features with dplyr syntax.
+
+```{r}
+# Transform features with Spark SQL API
+titanic2_tbl <- titanic_tbl %>% 
+  mutate(Family_Size = SibSp + Parch + 1L) %>% 
+  mutate(Pclass = as.character(Pclass)) %>%
+  filter(!is.na(Embarked)) %>%
+  mutate(Age = if_else(is.na(Age), mean(Age), Age)) %>%
+  sdf_register("titanic2")
+
+# sdf_register is used to save our table
+```
+
+# Spark ML transformation
+Use feature transforms with Spark ML. Use ft_bucketizer to bucket family sizes into groups.
+
+```{r}
+
+# Transform family size with Spark ML API
+titanic_final_tbl <- titanic2_tbl %>%
+  mutate(Family_Size = as.numeric(Family_size)) %>%
+  sdf_mutate(
+    Family_Sizes = ft_bucketizer(Family_Size, splits = c(1,2,5,12))
+    ) %>%
+  mutate(Family_Sizes = as.character(as.integer(Family_Sizes))) %>%
+  sdf_register("titanic_final")
 
 ```
-# Some options for working with spark result sets
-- use lazy excecution to construct statements and get the results on the fly
-- use sdf_register() to put the results into a spark table
-- use sdf_persist() to force any pending calcs to happen - doesn't necessarily persist in a nicly named object
-- use collect() to perform the calcs and bring the results into a data.frame in R
+Tip: You can use magrittr pipes to chain dplyr commands with sparklyr commands. For example,  mutate is a dplyr command that accesses the Spark SQL API whereas sdf_mutate is a sparklyr command that accesses the Spark ML API.
 
+# Train/test data
+Randomly partition the data into train and test sets.
 
+```{r}
 
+# Partition the data
+partition <- titanic_final_tbl %>% 
+  mutate(Survived = as.numeric(Survived), SibSp = as.numeric(SibSp), Parch = as.numeric(Parch)) %>%
+  select(Survived, Pclass, Sex, Age, SibSp, Parch, Fare, Embarked, Family_Sizes) %>%
+  sdf_partition(train = 0.75, test = 0.25, seed = 8585)
+
+# Create table references
+train_tbl <- partition$train
+test_tbl <- partition$test
+```
+Tip: Use sdf_partition to create training and testing splits.
+
+#Train the models
+Train multiple machine learning algorithms on the training data. Score the test data with the fitted models.
+
+##Logistic regression
+Logistic regression is one of the most common classifiers. Train the logistic regression and examine the predictors.
+
+```{r}
+# Model survival as a function of several predictors
+ml_formula <- formula(Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + Family_Sizes)
+
+# Train a logistic regression model
+(ml_log <- ml_logistic_regression(train_tbl, ml_formula))
+```
+
+## Other ML models in Spark
+Run the same formula using the other machine learning algorithms. Notice that training times vary greatly between methods.
+
+```{r}
+## Decision Tree
+ml_dt <- ml_decision_tree(train_tbl, ml_formula)
+
+## Random Forest
+ml_rf <- ml_random_forest(train_tbl, ml_formula)
+
+## Gradient Boosted Tree
+ml_gbt <- ml_gradient_boosted_trees(train_tbl, ml_formula)
+
+## Naive Bayes
+ml_nb <- ml_naive_bayes(train_tbl, ml_formula)
+
+## Neural Network
+ml_nn <- ml_multilayer_perceptron(train_tbl, ml_formula, layers = c(11,15,2))
+```
+
+# Validation data
+Score the test data with the trained models.
+
+```{r}
+# Bundle the modelss into a single list object
+ml_models <- list(
+  "Logistic" = ml_log,
+  "Decision Tree" = ml_dt,
+  "Random Forest" = ml_rf,
+  "Gradient Boosted Trees" = ml_gbt,
+  "Naive Bayes" = ml_nb,
+  "Neural Net" = ml_nn
+)
+
+# Create a function for scoring
+score_test_data <- function(model, data=test_tbl){
+  pred <- sdf_predict(model, data)
+  select(pred, Survived, prediction)
+}
+
+# Score all the models
+ml_score <- lapply(ml_models, score_test_data)
+```
+#Compare results
+Compare the model results. Examine performance metrics: lift, AUC, and accuracy. Also examine feature importance to see what features are most predictive of survival.
+
+##Model lift
+Lift compares how well the model predicts survival compared to random guessing. Use the function below to estimate model lift for each scored decile in the test data. The lift chart suggests that the tree models (random forest, gradient boosted trees, or the decision tree) will provide the best prediction.
+```{r}
+# Lift function
+calculate_lift <- function(scored_data) {
+  scored_data %>%
+    mutate(bin = ntile(desc(prediction), 10)) %>% 
+    group_by(bin) %>% 
+    summarize(count = sum(Survived)) %>% 
+    mutate(prop = count / sum(count)) %>% 
+    arrange(bin) %>% 
+    mutate(prop = cumsum(prop)) %>% 
+    select(-count) %>% 
+    collect() %>% 
+    as.data.frame()
+}
+
+# Initialize results
+ml_gains <- data.frame(bin = 1:10, prop = seq(0, 1, len = 10), model = "Base")
+
+# Calculate lift
+for(i in names(ml_score)){
+  ml_gains <- ml_score[[i]] %>%
+    calculate_lift %>%
+    mutate(model = i) %>%
+    rbind(ml_gains, .)
+}
+
+# Plot results
+ggplot(ml_gains, aes(x = bin, y = prop, colour = model)) +
+  geom_point() + geom_line() +
+  ggtitle("Lift Chart for Predicting Survival - Test Data Set") + 
+  xlab("") + ylab("")
+```
+
+# AUC and accuracy
+Though ROC curves are not available, Spark ML does have support for Area Under the ROC curve. This metric captures performance for specific cut-off values. The higher the AUC the better.
+```{r}
+# Function for calculating accuracy
+calc_accuracy <- function(data, cutpoint = 0.5){
+  data %>% 
+    mutate(prediction = if_else(prediction > cutpoint, 1.0, 0.0)) %>%
+    ml_classification_eval("prediction", "Survived", "accuracy")
+}
+
+# Calculate AUC and accuracy
+perf_metrics <- data.frame(
+  model = names(ml_score),
+  AUC = 100 * sapply(ml_score, ml_binary_classification_eval, "Survived", "prediction"),
+  Accuracy = 100 * sapply(ml_score, calc_accuracy),
+  row.names = NULL, stringsAsFactors = FALSE)
+
+# Plot results
+gather(perf_metrics, metric, value, AUC, Accuracy) %>%
+  ggplot(aes(reorder(model, value), value, fill = metric)) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  coord_flip() +
+  xlab("") +
+  ylab("Percent") +
+  ggtitle("Performance Metrics")
+```
+
+#Feature importance
+It is also interesting to compare the features that were identified by each model as being important predictors for survival. The logistic regression and tree models implement feature importance metrics. Sex, fare, and age are some of the most important features.
+
+```{r}
+# Initialize results
+feature_importance <- data.frame()
+
+# Calculate feature importance
+for(i in c("Decision Tree", "Random Forest", "Gradient Boosted Trees")){
+  feature_importance <- ml_tree_feature_importance(sc, ml_models[[i]]) %>%
+    mutate(Model = i) %>%
+    mutate(importance = as.numeric(levels(importance))[importance]) %>%
+    mutate(feature = as.character(feature)) %>%
+    rbind(feature_importance, .)
+}
+
+# Plot results
+feature_importance %>%
+  ggplot(aes(reorder(feature, importance), importance, fill = Model)) + 
+  facet_wrap(~Model) +
+  geom_bar(stat = "identity") + 
+  coord_flip() +
+  xlab("") +
+  ggtitle("Feature Importance")
+```
+
+#Compare run times
+The time to train a model is important. Use the following code to evaluate each model n times and plots the results. Notice that gradient boosted trees and neural nets take considerably longer to train the the other methods.
+```{r}
+# Number of reps per model
+n <- 10
+
+# Format model formula as character
+format_as_character <- function(x){
+  x <- paste(deparse(x), collapse = "")
+  x <- gsub("\\s+", " ", paste(x, collapse = ""))
+  x
+}
+
+# Create model statements with timers
+format_statements <- function(y){
+  y <- format_as_character(y[[".call"]])
+  y <- gsub('ml_formula', ml_formula_char, y)
+  y <- paste0("system.time(", y, ")")
+  y
+}
+
+# Convert model formula to character
+ml_formula_char <- format_as_character(ml_formula)
+
+# Create n replicates of each model statements with timers
+all_statements <- sapply(ml_models, format_statements) %>%
+  rep(., n) %>%
+  parse(text = .)
+
+# Evaluate all model statements
+res  <- map(all_statements, eval)
+
+# Compile results
+result <- data.frame(model = rep(names(ml_models), n),
+                     time = sapply(res, function(x){as.numeric(x["elapsed"])})) 
+
+# Plot
+result %>% ggplot(aes(time, reorder(model, time))) + 
+  geom_boxplot() + 
+  geom_jitter(width = 0.4, aes(colour = model)) +
+  scale_colour_discrete(guide = FALSE) +
+  xlab("Seconds") +
+  ylab("") +
+  ggtitle("Model training times")
+```
